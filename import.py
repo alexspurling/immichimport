@@ -5,7 +5,7 @@ from datetime import datetime
 from secrets import api_url, api_key
 
 
-local_album_dir = "/home/alex/Downloads/Google Photos Albums"
+local_album_dir = "/home/alex/Downloads/Takeout/Google Photos"
 headers = {
     "Accept": "application/json",
     "x-api-key": api_key
@@ -53,18 +53,28 @@ def upload_asset(asset_path):
     if resp.status_code != 200 and resp.status_code != 201:
         raise Exception("Error uploading asset", resp.status_code, resp.text)
 
-    return json.loads(resp.text)
+    asset = json.loads(resp.text)
+    print("Uploaded asset", asset["id"], "status:", asset['status'])
+    return asset
 
 
-def upload_album(album, album_path):
+def upload_album(album, album_path, files_already_uploaded=[]):
     # First upload the photos as assets
+    print(f"Uploading album {album['albumName']} ({album['id']}) with {len(files_already_uploaded)} files already uploaded")
     album_asset_ids = []
     for photo in os.listdir(album_path):
+        if photo.endswith(".json") or photo.endswith(".MP"):
+            continue
         photo_path = os.path.join(album_path, photo)
+        if photo_path in files_already_uploaded:
+            continue
         print("Uploading", photo_path)
         asset = upload_asset(photo_path)
-        print("Uploaded asset", asset["id"])
         album_asset_ids.append(asset["id"])
+
+        # There is a maximum number of 1000 assets per request
+        if len(album_asset_ids) == 1000:
+            break
 
     print("Adding", len(album_asset_ids), "assets to album")
     album_assets = {
@@ -73,14 +83,11 @@ def upload_album(album, album_path):
     resp = requests.put(f"{api_url}/albums/{album['id']}/assets", data=album_assets, headers=headers)
 
     if resp.status_code != 200:
-        raise Exception("Error adding assets to album", resp.status_code, resp.text)
+        if "ids must be an array" not in resp.text:
+            raise Exception("Error adding assets to album", resp.status_code, resp.text)
 
 
-def import_albums():
-    albums_to_import = os.listdir(local_album_dir)
-
-    # Get the list of albums from Immich
-
+def get_existing_albums():
     resp = requests.get(f"{api_url}/albums", headers=headers)
 
     if resp.status_code != 200:
@@ -88,26 +95,71 @@ def import_albums():
         return
 
     existing_albums = json.loads(resp.text)
-    existing_album_names = []
-
+    album_map = {}
     for album in existing_albums:
-        existing_album_names.append(album['albumName'])
-        print(album)
+        album_map[album['albumName']] = album
+    return album_map
 
-    # Iterate through all local albums that have not yet been created
-    for album in [a for a in albums_to_import if a not in existing_album_names]:
-        create_album(album)
 
-    # Iterate through all albums that are empty
-    for album in [a for a in existing_albums if a["assetCount"] == 0]:
+def upload_unuploaded_assets(local_album, album_info):
 
-        album_path = os.path.join(local_album_dir, album["albumName"])
+    album_path = os.path.join(local_album_dir, local_album)
 
-        if os.path.exists(album_path) and len(os.listdir(album_path)) > 0:
-            print("Uploading album", album["albumName"], album_path)
-            upload_album(album, album_path)
+    files_already_uploaded = []
+    for asset in album_info['assets']:
+        file_and_date = asset['deviceAssetId']
+        sep_idx = file_and_date.rfind("-")
+        file_path = file_and_date[:sep_idx]
+        if os.path.exists(file_path):
+            files_already_uploaded.append(file_path)
+            continue
+        # This deviceAssetId does not always have the original file path for some reason
+        # Try to reconstruct it from the album path and file name
+        file_path = os.path.join(album_path, asset['originalFileName'])
+        if os.path.exists(file_path):
+            files_already_uploaded.append(file_path)
         else:
-            print("No photos to upload in", album_path)
+            print("Could not find local file:", file_path)
+
+    upload_album(album_info, album_path, files_already_uploaded)
+
+
+def import_albums():
+    albums_to_import = os.listdir(local_album_dir)
+
+    # Get the list of albums from Immich
+
+    existing_albums = get_existing_albums()
+
+    # for album in existing_albums:
+    #     existing_album_names.append(album['albumName'])
+    #     print(album)
+
+    # # Iterate through all local albums that have not yet been created
+    # for album in [a['albumName'] for a in albums_to_import if a not in existing_albums]:
+    #     create_album(album)
+
+    # Iterate through all local albums and upload assets that haven't already been uploaded
+
+    for album in albums_to_import:
+        existing_album = existing_albums.get(album)
+        if existing_album is not None:
+            # Album already exists, try to get a list of asset files
+            album_info = get_album_info(existing_album)
+            upload_unuploaded_assets(album, album_info)
+            print("Album", album_info['albumName'], "has", len(album_info['assets']), "assets")
+        else:
+            print("Album", album, "does not exist")
+    #
+    # for album in [a for a in existing_albums if a["assetCount"] == 0]:
+    #
+    #     album_path = os.path.join(local_album_dir, album["albumName"])
+    #
+    #     if os.path.exists(album_path) and len(os.listdir(album_path)) > 0:
+    #         print("Uploading album", album["albumName"], album_path)
+    #         upload_album(album, album_path)
+    #     else:
+    #         print("No photos to upload in", album_path)
 
         # Get existing assets in album
         # album_info = get_album_info(album)
